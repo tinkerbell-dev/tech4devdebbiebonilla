@@ -1,0 +1,286 @@
+---
+name: $(SourceBranchName)_$(date:yyyyMMdd)$(rev:.r)
+
+variables:
+  - name: organization
+    value: 'Tech4Dev'
+  - name: project
+    value: 'DebbieAdoDemo'
+
+parameters:
+  - name: repositoryName
+    type: string
+    default: ''
+    displayName: 'Enter ADO Repository Name'
+
+trigger:
+  - main
+
+pool:
+    vmImage: 'ubuntu-latest'
+
+stages:
+- stage: CheckoutAndTest
+  displayName: 'Checkout Repository'
+  jobs:
+  - job: CheckoutRepositoryJob
+    displayName: 'Checkout Job'
+    steps:
+    - checkout: self
+      displayName: 'Checkout Repository'
+
+    - task: PowerShell@2
+      displayName: 'Get default branch from Azure DevOps REST API'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $org = '${{ variables.organization }}'
+          $project = '${{ variables.project }}'
+          $repo = '${{ parameters.repositoryName }}'
+          $pat = "$(System.AccessToken)" 
+  
+          $headers = @{
+            Authorization = "Bearer $pat"
+          }
+  
+          $repoUrl = "https://dev.azure.com/$org/$project/_apis/git/repositories/$repo?api-version=7.1-preview.1"
+          $repo = Invoke-RestMethod -Uri $repoUrl -Headers $headers -Method GET
+          $repoId = $repo.id
+  
+          # The defaultBranch value includes 'refs/heads/' prefix
+          $defaultBranchName = $response.defaultBranch -replace 'refs/heads/', ''
+          Write-Host "##vso[task.setvariable variable=defaultBranch]$defaultBranchName"
+          Write-Host "##vso[task.setvariable variable=repoId]$repoId"
+
+    - script: |
+        echo "defaultBranch=$(defaultBranch)"
+      displayName: 'Show the default branch variable'
+
+    - task: PowerShell@2
+      displayName: 'Get default branch and check branch permissions'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Security Namespace for Git Repos
+          $securityNamespaceId = "52d39943-cb85-4d7f-8fa8-c6baac873819"
+          
+          # Token format for branch
+          $securityToken = "repoV2/$(repoId)/refs/heads/$(defaultBranch)"
+          
+          #Write-Host "Security token for branch: $securityToken"
+          
+          # Query Access Control Entries for current user (example: authenticated user descriptor)
+          $descriptorUrl = "https://vssps.dev.azure.com/$org/_apis/graph/descriptors/$(Build.RequestedForId)?api-version=7.1-preview.1"
+          $descriptorResp = Invoke-RestMethod -Uri $descriptorUrl -Headers $headers -Method Get
+          $userDescriptor = $descriptorResp.value
+          
+          Write-Host "User descriptor: $userDescriptor"
+
+          # Compose Access Control Entries query
+          $acesUrl = "https://dev.azure.com/$org/_apis/accesscontrolentries/$securityNamespaceId?api-version=7.1-preview.1&token=$securityToken&descriptors=$userDescriptor"
+
+          Write-Host "Getting Access Control Entries for branch permissions"
+          $aces = Invoke-RestMethod -Uri $acesUrl -Headers $headers -Method Get
+
+          # Output permissions 
+          Write-Host "Permissions ACEs:"
+          $aces.entries | ConvertTo-Json | Write-Host
+          Write-Host "##vso[task.setvariable variable=aces]$aces"
+
+    - task: PowerShell@2
+      displayName: 'Check branch policies'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Check ACEs entries
+          if ($(aces).entries.Count -eq 0) {
+            Write-Host "No access control entries found for 'everyone' on the branch."
+            exit 0
+          }
+        
+            $ace = $(aces).entries[0]
+        
+            # Permissions are stored in 'allow' and 'deny' as integers (bitmasks)
+            $deny = $ace.deny
+            $allow = $ace.allow
+        
+            # Force Push permission bit = 8
+            $forcePushBit = 8
+            $editPoliciesBit = 1024
+            $bypassPoliciesBitPr = 8192
+            $bypassPoliciesBitPush = 16384
+          
+            $forcePushDenied = ($deny -band $forcePushBit) -ne 0
+            $editPoliciesDenied = ($deny -band $editPoliciesBit) -ne 0
+            $bypassPoliciesBitPr = ($deny -band $editPoliciesBit) -ne 0
+            $bypassPoliciesBitPush = ($deny -band $editPoliciesBit) -ne 0
+          
+            Write-Host "##vso[task.setvariable variable=forcePushDenied]$forcePushDenied"
+            Write-Host "##vso[task.setvariable variable=editPoliciesDenied]$editPoliciesDenied"
+            Write-Host "##vso[task.setvariable variable=bypassPoliciesBitPr]$bypassPoliciesBitPr"
+            Write-Host "##vso[task.setvariable variable=bypassPoliciesBitPush]$bypassPoliciesBitPush"
+          
+            if ($forcePushDenied) {
+              Write-Host "Force Push is DENIED for everyone on branch '$(defaultBranch)'."
+            } else {
+              Write-Host "Force Push is NOT denied for everyone on branch '$(defaultBranch)'."              
+            }
+          
+            if ($editPoliciesDenied) {
+              Write-Host "Edit Policies is DENIED for everyone on branch '$(defaultBranch)'."
+            } else {
+              Write-Host "Edit Policies is NOT denied for everyone on branch '$(defaultBranch)'."
+            }
+          
+            if ($bypassPoliciesBitPr) {
+              Write-Host "Bypass policies when completing pull requests is DENIED for everyone on branch '$(defaultBranch)'."
+            } else {
+              Write-Host "Bypass policies when completing pull requests is NOT denied for everyone on branch '$(defaultBranch)'."
+            }
+          
+            if ($bypassPoliciesBitPush) {
+              Write-Host "Bypass policies when pushing is DENIED for everyone on branch '$(defaultBranch)'."
+            } else {
+              Write-Host "Bypass policies when pushing is NOT denied for everyone on branch '$(defaultBranch)'."
+            }
+
+    - task: PowerShell@2
+      displayName: 'Check branch policies'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $org = '${{ variables.organization }}'
+          $project = '${{ variables.project }}'
+          $repo = '${{ parameters.repositoryName }}'
+          $pat = "$(System.AccessToken)" 
+          $repoId = "$(repoId)"
+          $defaultBranch = "$(defaultBranch)"
+          
+          # List policy configurations for the repo
+          $policyUrl = "https://dev.azure.com/$org/$project/_apis/policy/configurations?repositoryId=$repoId&refName=refs/heads/$defaultBranch&api-version=7.1-preview.1"
+          $policies = Invoke-RestMethod -Uri $policyUrl -Headers $headers -Method Get
+      
+          # Policy ID for Minimum number of reviewers
+          $minimumReviewersPolicyId = "fa4e907d-c16b-4a4c-9dfa-4906e5d171dd"      
+          $minReviewersPolicies = $policies.value | Where-Object { $_.type.id -eq $minimumReviewersPolicyId }
+      
+          if ($minReviewersPolicies.Count -eq 0) {
+            Write-Host "No 'Minimum number of reviewers' policy found on branch $defaultBranch."
+            exit 1
+          }
+      
+          # Typically, there should be only one such policy per branch
+          $policy = $minReviewersPolicies[0]
+          $settings = $policy.settings
+      
+          $minApprovers = $settings.minimumApproverCount
+          # if enabled (=true), does not reset votes on reject/wait
+          $resetVotes = $settings.resetOnSourcePush
+      
+          Write-Host "Minimum number of reviewers required: $minApprovers"
+          Write-Host "Reset all approval votes on new push: $resetVotes"
+          
+          $minApproversPolicyNeedsUpdate = $true
+          if ($minApprovers -eq 2) {
+            Write-Host "✔ Minimum number of reviewers IS set to 2."
+            $minApproversPolicyNeedsUpdate = $false
+          } else {
+            Write-Host "✘ Minimum number of reviewers IS NOT set to 2."
+          }
+      
+          if ($resetVotes -eq $true) {
+            Write-Host "✔ Reset all approval votes IS enabled."
+            Write-Host "Does not reset votes on reject/wait."
+          } else {
+            Write-Host "✘ Reset all approval votes IS NOT enabled."
+          }
+          
+          Write-Host "##vso[task.setvariable variable=$minReviewersPolicies]$minReviewersPolicies"
+          Write-Host "##vso[task.setvariable variable=minApproversPolicyNeedsUpdate]$minApproversPolicyNeedsUpdate"
+
+    - task: PowerShell@2
+      displayName: 'Enforce branch protection policies'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $org = '${{ variables.organization }}'
+          $project = '${{ variables.project }}'
+          $repo = '${{ parameters.repositoryName }}'
+          $pat = "$(System.AccessToken)" 
+          $defaultBranch = "$(defaultBranch)"
+          $repoId = "$(repoId)"
+          $defaultBranch = "$(defaultBranch)"
+          
+          $headers = @{
+            Authorization = "Bearer $pat"
+          }
+          
+          # Security Namespace and token for branch permissions
+          $securityNamespaceId = "52d39943-cb85-4d7f-8fa8-c6baac873819"
+          $securityToken = "repoV2/$repoId/refs/heads/$defaultBranch"
+          $everyoneDescriptor = "Microsoft.IdentityModel.Claims.ClaimsIdentity;S-1-1-0"
+          
+          if (-not $(forcePushDenied)) {
+            Write-Host "Force Push is NOT denied for everyone. Updating permission to deny Force Push..."
+      
+            # Build ACE entry to deny Force Push
+            $denyBits = $ace.deny
+            if ($denyBits -eq $null) { $denyBits = 0 }
+            $newDenyBits = $denyBits -bor $forcePushBit
+      
+            $body = @"
+            {
+              "token": "$securityToken",
+              "descriptors": [
+                {
+                  "descriptor": "$everyoneDescriptor",
+                  "allow": 0,
+                  "deny": $newDenyBits
+                }
+              ]
+            }
+            "@
+      
+            $aclUrl = "https://dev.azure.com/$org/_apis/accesscontrolentries/$securityNamespaceId?api-version=7.1-preview.1"
+      
+            $response = Invoke-RestMethod -Uri $aclUrl -Headers $headers -Method Post -Body $body
+            Write-Host "Updated branch permissions to deny Force Push for everyone."
+          }
+          
+          if ($(minApproversPolicyNeedsUpdate)) {
+            Write-Host "Creating or updating minimum reviewers policy to require 2 reviewers and reset approval votes..."
+      
+            $policyBody = @{
+              isEnabled = $true
+              isBlocking = $true
+              type = @{
+              id = $minimumReviewersPolicyId
+            }
+            settings = @{
+              minimumApproverCount = 2
+              creatorVoteCounts = $false
+              allowDownvotes = $true
+              resetOnSourcePush = $true
+              scope = @(@{
+              repositoryId = $repoId
+              refName = "refs/heads/$defaultBranch"
+              matchKind = "Exact"
+              })
+            }
+          } | ConvertTo-Json -Depth 10
+      
+          if ($(minReviewerPolicies).Count -eq 0) {
+            # Create new policy
+            $createPolicyUrl = "https://dev.azure.com/$org/$project/_apis/policy/configurations?api-version=7.1-preview.1"
+            $response = Invoke-RestMethod -Uri $createPolicyUrl -Headers $headers -Method Post -Body $policyBody
+            Write-Host "Created minimum reviewers policy."
+          }
+          else {
+            # Update existing policy
+            $policyId = $(minReviewerPolicies)[0].id
+            $updatePolicyUrl = "https://dev.azure.com/$org/$project/_apis/policy/configurations/$policyId?api-version=7.1-preview.1"
+            $response = Invoke-RestMethod -Uri $updatePolicyUrl -Headers $headers -Method Put -Body $policyBody
+            Write-Host "Updated minimum reviewers policy."
+          }
+        }
+          
