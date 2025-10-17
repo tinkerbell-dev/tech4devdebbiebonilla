@@ -26,7 +26,7 @@ stages:
   - job: CheckoutRepositoryJob
     displayName: 'Checkout Job'
     steps:
-    - checkout: self
+    - checkout: ${{ parameters.repositoryName }}
       displayName: 'Checkout Repository'
 
     - task: PowerShell@2
